@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import math
 from cmath import exp
@@ -10,6 +11,7 @@ from pathlib import Path
 
 NM_PER_M = 1e9
 UM_PER_M = 1e6
+C_M_PER_S = 299_792_458.0
 MIN_DB_FLOOR = -60.0
 DEFAULT_CENTER_WAVELENGTH_NM = 1550.0
 DEFAULT_EFFECTIVE_INDEX = 2.40
@@ -18,6 +20,10 @@ PAPER_LAN_CENTER_WAVELENGTH_NM = 1291.0
 PAPER_LAN_EFFECTIVE_INDEX = 2.93
 PAPER_LAN_GROUP_INDEX = 3.83
 PAPER_LAN_CHANNEL_WAVELENGTHS_NM = (1273.5, 1277.9, 1282.3, 1286.7, 1295.6, 1300.1, 1304.6, 1309.1)
+PUB_16WDM_CHANNEL_COUNT = 16
+PUB_16WDM_CHANNEL_SPACING_GHZ = 800.0
+PUB_16WDM_COUPLER_EXCESS_LOSS_DB = 0.03
+PUB_16WDM_PORT_CHANNELS = (1, 9, 13, 5, 3, 11, 15, 7, 2, 10, 14, 6, 4, 12, 16, 8)
 
 
 @dataclass(frozen=True)
@@ -102,16 +108,141 @@ class LANDemux:
         return 3
 
 
+@dataclass(frozen=True)
+class CouplerResponse:
+    wavelengths_nm: tuple[float, ...]
+    coupling_ratios: tuple[float, ...]
+    excess_loss_db: tuple[float, ...]
+    source_name: str = "constant"
+
+    def coupling_ratio(self, wavelength_nm: float) -> float:
+        return interpolate_series(self.wavelengths_nm, self.coupling_ratios, wavelength_nm)
+
+    def loss_db(self, wavelength_nm: float) -> float:
+        return interpolate_series(self.wavelengths_nm, self.excess_loss_db, wavelength_nm)
+
+
+@dataclass(frozen=True)
+class WDMSplitterStage:
+    name: str
+    level: int
+    node_index: int
+    delta_length_m: float
+    phase_offset_rad: float
+    through_channels: tuple[int, ...]
+    cross_channels: tuple[int, ...]
+
+    @property
+    def delta_length_um(self) -> float:
+        return self.delta_length_m * UM_PER_M
+
+
+@dataclass(frozen=True)
+class CascadedWDMDemux:
+    center_wavelength_nm: float
+    effective_index: float
+    group_index: float
+    channel_spacing_ghz: float
+    channel_wavelengths_nm: tuple[float, ...]
+    port_channels: tuple[int, ...]
+    stages: tuple[WDMSplitterStage, ...]
+    coupler_response: CouplerResponse
+    source_name: str
+
+    @property
+    def channel_count(self) -> int:
+        return len(self.channel_wavelengths_nm)
+
+    @property
+    def order(self) -> int:
+        return int(math.log2(self.channel_count))
+
+
 def linear_to_db(power: float, floor_db: float = MIN_DB_FLOOR) -> float:
     if power <= 0.0:
         return floor_db
     return max(floor_db, 10.0 * math.log10(power))
 
 
+def interpolate_series(x_values: tuple[float, ...], y_values: tuple[float, ...], x: float) -> float:
+    if len(x_values) != len(y_values) or not x_values:
+        raise ValueError("Interpolation series must have the same nonzero length.")
+    if len(x_values) == 1 or x <= x_values[0]:
+        return y_values[0]
+    if x >= x_values[-1]:
+        return y_values[-1]
+
+    upper_index = bisect.bisect_left(x_values, x)
+    x0 = x_values[upper_index - 1]
+    x1 = x_values[upper_index]
+    y0 = y_values[upper_index - 1]
+    y1 = y_values[upper_index]
+    return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+
+
+def constant_coupler_response(
+    coupling_ratio: float,
+    excess_loss_db: float = 0.0,
+    source_name: str = "constant",
+) -> CouplerResponse:
+    if not 0 < coupling_ratio < 1:
+        raise ValueError("coupling_ratio must be between 0 and 1.")
+    if excess_loss_db < 0:
+        raise ValueError("excess_loss_db must not be negative.")
+    return CouplerResponse(
+        wavelengths_nm=(0.0,),
+        coupling_ratios=(coupling_ratio,),
+        excess_loss_db=(excess_loss_db,),
+        source_name=source_name,
+    )
+
+
+def load_coupler_response_csv(
+    path: Path,
+    ratio_column: str,
+    wavelength_column: str,
+    loss_column: str | None,
+    fallback_loss_db: float,
+) -> CouplerResponse:
+    rows: list[tuple[float, float, float]] = []
+    with path.open(newline="", encoding="utf-8-sig") as csv_file:
+        reader = csv.DictReader(csv_file)
+        if reader.fieldnames is None:
+            raise ValueError(f"Coupler file '{path}' has no header row.")
+        missing = [column for column in (wavelength_column, ratio_column) if column not in reader.fieldnames]
+        if missing:
+            raise ValueError(f"Coupler file '{path}' is missing columns: {', '.join(missing)}.")
+        has_loss_column = loss_column is not None and loss_column in reader.fieldnames
+        for row in reader:
+            wavelength_nm = float(row[wavelength_column])
+            coupling_ratio = float(row[ratio_column])
+            loss_db = float(row[loss_column]) if has_loss_column else fallback_loss_db
+            if not 0 < coupling_ratio < 1:
+                raise ValueError(f"Coupler ratio must be between 0 and 1, got {coupling_ratio}.")
+            if loss_db < 0:
+                raise ValueError(f"Coupler excess loss must not be negative, got {loss_db}.")
+            rows.append((wavelength_nm, coupling_ratio, loss_db))
+
+    if not rows:
+        raise ValueError(f"Coupler file '{path}' does not contain data rows.")
+
+    rows.sort(key=lambda item: item[0])
+    return CouplerResponse(
+        wavelengths_nm=tuple(row[0] for row in rows),
+        coupling_ratios=tuple(row[1] for row in rows),
+        excess_loss_db=tuple(row[2] for row in rows),
+        source_name=str(path),
+    )
+
+
 def compute_delta_length_m(center_wavelength_nm: float, group_index: float, fsr_nm: float) -> float:
     wavelength_m = center_wavelength_nm / NM_PER_M
     fsr_m = fsr_nm / NM_PER_M
     return wavelength_m**2 / (group_index * fsr_m)
+
+
+def compute_delta_length_from_fsr_hz(group_index: float, fsr_hz: float) -> float:
+    return C_M_PER_S / (group_index * fsr_hz)
 
 
 def compute_pi_length_m(center_wavelength_nm: float, effective_index: float) -> float:
@@ -260,6 +391,7 @@ def build_lan_wdm_demux(
     channel_spacing_nm: float,
     coupler_ratio: float,
     channel_wavelengths_nm: tuple[float, ...] = PAPER_LAN_CHANNEL_WAVELENGTHS_NM,
+    optimize_phase_offsets: bool = True,
 ) -> LANDemux:
     if center_wavelength_nm <= 0 or channel_spacing_nm <= 0:
         raise ValueError("Wavelength and channel spacing must be positive.")
@@ -319,20 +451,125 @@ def build_lan_wdm_demux(
                 name=name,
                 delta_length_m=delta_length_m,
                 coupler_ratio=coupler_ratio,
-                phase_offset_rad=optimize_amzi_phase_offset(
-                    delta_length_m=delta_length_m,
-                    coupling_ratio=coupler_ratio,
-                    through_wavelengths_nm=tuple(through_wavelengths_nm),
-                    cross_wavelengths_nm=tuple(cross_wavelengths_nm),
-                    center_wavelength_nm=center_wavelength_nm,
-                    effective_index=effective_index,
-                    group_index=group_index,
+                phase_offset_rad=(
+                    optimize_amzi_phase_offset(
+                        delta_length_m=delta_length_m,
+                        coupling_ratio=coupler_ratio,
+                        through_wavelengths_nm=tuple(through_wavelengths_nm),
+                        cross_wavelengths_nm=tuple(cross_wavelengths_nm),
+                        center_wavelength_nm=center_wavelength_nm,
+                        effective_index=effective_index,
+                        group_index=group_index,
+                    )
+                    if optimize_phase_offsets
+                    else 0.0
                 ),
             )
             for name, delta_length_m, through_wavelengths_nm, cross_wavelengths_nm in stage_specs
         ),
         channel_wavelengths_nm=channel_wavelengths_nm,
         port_wavelengths_nm=(channel_1, channel_9, channel_3, channel_7, channel_2, channel_6, channel_4, channel_8),
+    )
+
+
+def frequency_grid_wavelengths_nm(
+    center_wavelength_nm: float,
+    channel_spacing_ghz: float,
+    channel_count: int,
+) -> tuple[float, ...]:
+    if channel_count < 2 or channel_count & (channel_count - 1):
+        raise ValueError("channel_count must be a power of two and at least 2.")
+    if center_wavelength_nm <= 0 or channel_spacing_ghz <= 0:
+        raise ValueError("Center wavelength and channel spacing must be positive.")
+
+    center_frequency_hz = C_M_PER_S / (center_wavelength_nm / NM_PER_M)
+    spacing_hz = channel_spacing_ghz * 1e9
+    midpoint = (channel_count + 1) / 2.0
+    wavelengths: list[float] = []
+    for channel_index in range(1, channel_count + 1):
+        frequency_hz = center_frequency_hz + (midpoint - channel_index) * spacing_hz
+        wavelengths.append(C_M_PER_S / frequency_hz * NM_PER_M)
+    return tuple(wavelengths)
+
+
+def build_pub_16wdm_demux(
+    center_wavelength_nm: float,
+    effective_index: float,
+    group_index: float,
+    channel_spacing_ghz: float,
+    coupler_response: CouplerResponse,
+    optimize_phase_offsets: bool = True,
+) -> CascadedWDMDemux:
+    if center_wavelength_nm <= 0 or channel_spacing_ghz <= 0:
+        raise ValueError("Center wavelength and channel spacing must be positive.")
+    if effective_index <= 0 or group_index <= 0:
+        raise ValueError("Indices must be positive.")
+
+    channel_wavelengths_nm = frequency_grid_wavelengths_nm(
+        center_wavelength_nm=center_wavelength_nm,
+        channel_spacing_ghz=channel_spacing_ghz,
+        channel_count=PUB_16WDM_CHANNEL_COUNT,
+    )
+    channel_wavelength_by_index = {
+        channel_index: channel_wavelengths_nm[channel_index - 1]
+        for channel_index in range(1, PUB_16WDM_CHANNEL_COUNT + 1)
+    }
+    base_delta_length_m = compute_delta_length_from_fsr_hz(
+        group_index=group_index,
+        fsr_hz=2.0 * channel_spacing_ghz * 1e9,
+    )
+
+    stages: list[WDMSplitterStage] = []
+
+    def add_stages(channels: tuple[int, ...], level: int, node_index: int) -> None:
+        if len(channels) == 1:
+            return
+        half = len(channels) // 2
+        through_channels = channels[:half]
+        cross_channels = channels[half:]
+        delta_length_m = base_delta_length_m / (2 ** (level - 1))
+        coupling_ratio = coupler_response.coupling_ratio(center_wavelength_nm)
+        phase_offset_rad = (
+            optimize_amzi_phase_offset(
+                delta_length_m=delta_length_m,
+                coupling_ratio=coupling_ratio,
+                through_wavelengths_nm=tuple(channel_wavelength_by_index[index] for index in through_channels),
+                cross_wavelengths_nm=tuple(channel_wavelength_by_index[index] for index in cross_channels),
+                center_wavelength_nm=center_wavelength_nm,
+                effective_index=effective_index,
+                group_index=group_index,
+            )
+            if optimize_phase_offsets
+            else 0.0
+        )
+        name = "MZI 1" if level == 1 else f"MZI {level}.{node_index}"
+        stages.append(
+            WDMSplitterStage(
+                name=name,
+                level=level,
+                node_index=node_index,
+                delta_length_m=delta_length_m,
+                phase_offset_rad=phase_offset_rad,
+                through_channels=through_channels,
+                cross_channels=cross_channels,
+            )
+        )
+        add_stages(through_channels, level + 1, 2 * node_index - 1)
+        add_stages(cross_channels, level + 1, 2 * node_index)
+
+    add_stages(PUB_16WDM_PORT_CHANNELS, level=1, node_index=1)
+    stages.sort(key=lambda stage: (stage.level, stage.node_index))
+
+    return CascadedWDMDemux(
+        center_wavelength_nm=center_wavelength_nm,
+        effective_index=effective_index,
+        group_index=group_index,
+        channel_spacing_ghz=channel_spacing_ghz,
+        channel_wavelengths_nm=channel_wavelengths_nm,
+        port_channels=PUB_16WDM_PORT_CHANNELS,
+        stages=tuple(stages),
+        coupler_response=coupler_response,
+        source_name="pub_5335 Fig. 5 provisional 16-channel WDM",
     )
 
 
@@ -419,6 +656,28 @@ def amzi_port_powers(
         phase_offset_rad=center_phase_rad,
     )
     return amzi_power_from_phase(coupling_ratio, phase)
+
+
+def amzi_port_powers_with_coupler(
+    delta_length_m: float,
+    coupler_response: CouplerResponse,
+    wavelength_nm: float,
+    center_wavelength_nm: float,
+    effective_index: float,
+    group_index: float,
+    center_phase_rad: float,
+) -> tuple[float, float]:
+    through_power, cross_power = amzi_port_powers(
+        delta_length_m=delta_length_m,
+        coupling_ratio=coupler_response.coupling_ratio(wavelength_nm),
+        wavelength_nm=wavelength_nm,
+        center_wavelength_nm=center_wavelength_nm,
+        effective_index=effective_index,
+        group_index=group_index,
+        center_phase_rad=center_phase_rad,
+    )
+    mzi_loss_linear = 10.0 ** (-(2.0 * coupler_response.loss_db(wavelength_nm)) / 10.0)
+    return mzi_loss_linear * through_power, mzi_loss_linear * cross_power
 
 
 def stage_transfer(
@@ -554,6 +813,52 @@ def lan_demux_spectrum(
     return values
 
 
+def cascaded_wdm_transfer(design: CascadedWDMDemux, wavelength_nm: float) -> tuple[float, ...]:
+    node_inputs: dict[tuple[int, int], float] = {(1, 1): 1.0}
+    channel_powers: dict[int, float] = {}
+
+    for stage in design.stages:
+        input_power = node_inputs.get((stage.level, stage.node_index), 0.0)
+        through_power, cross_power = amzi_port_powers_with_coupler(
+            delta_length_m=stage.delta_length_m,
+            coupler_response=design.coupler_response,
+            wavelength_nm=wavelength_nm,
+            center_wavelength_nm=design.center_wavelength_nm,
+            effective_index=design.effective_index,
+            group_index=design.group_index,
+            center_phase_rad=stage.phase_offset_rad,
+        )
+        through_output = input_power * through_power
+        cross_output = input_power * cross_power
+        if stage.level < design.order:
+            node_inputs[(stage.level + 1, 2 * stage.node_index - 1)] = through_output
+            node_inputs[(stage.level + 1, 2 * stage.node_index)] = cross_output
+        else:
+            channel_powers[stage.through_channels[0]] = through_output
+            channel_powers[stage.cross_channels[0]] = cross_output
+
+    return tuple(channel_powers[channel] for channel in design.port_channels)
+
+
+def cascaded_wdm_spectrum(
+    design: CascadedWDMDemux,
+    start_nm: float,
+    stop_nm: float,
+    points: int,
+) -> list[tuple[float, tuple[float, ...]]]:
+    if points < 2:
+        raise ValueError("points must be 2 or larger.")
+    if stop_nm <= start_nm:
+        raise ValueError("stop_nm must be larger than start_nm.")
+
+    values: list[tuple[float, tuple[float, ...]]] = []
+    step = (stop_nm - start_nm) / (points - 1)
+    for idx in range(points):
+        wavelength_nm = start_nm + idx * step
+        values.append((wavelength_nm, cascaded_wdm_transfer(design, wavelength_nm)))
+    return values
+
+
 def save_spectrum_csv(path: Path, rows: list[tuple[float, float]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
@@ -575,6 +880,16 @@ def save_lan_demux_spectrum_csv(path: Path, rows: list[tuple[float, tuple[float,
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(["wavelength_nm", *(f"port_{index}_db" for index in range(1, 9))])
+        writer.writerows(
+            (wavelength_nm, *(linear_to_db(power) for power in port_powers))
+            for wavelength_nm, port_powers in rows
+        )
+
+
+def save_multiport_spectrum_csv(path: Path, rows: list[tuple[float, tuple[float, ...]]], port_count: int) -> None:
+    with path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["wavelength_nm", *(f"port_{index}_db" for index in range(1, port_count + 1))])
         writer.writerows(
             (wavelength_nm, *(linear_to_db(power) for power in port_powers))
             for wavelength_nm, port_powers in rows
@@ -744,6 +1059,61 @@ def plot_lan_demux_spectrum(
     plt.close(fig)
 
 
+def plot_cascaded_wdm_spectrum(
+    design: CascadedWDMDemux,
+    rows: list[tuple[float, tuple[float, ...]]],
+    output_path: Path | None = None,
+    show_plot: bool = False,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "matplotlib is not installed. Install it with 'pip install matplotlib' to enable plotting."
+        ) from exc
+
+    wavelengths = [row[0] for row in rows]
+
+    fig, ax = plt.subplots(figsize=(10.0, 5.6))
+    for port_index, channel_index in enumerate(design.port_channels):
+        port_db = [linear_to_db(row[1][port_index]) for row in rows]
+        ax.plot(wavelengths, port_db, label=f"P{port_index + 1}/ch{channel_index}", linewidth=1.25)
+
+    ax.set_title("16-Channel Cascaded MZI WDM Demux")
+    ax.set_xlabel("Wavelength [nm]")
+    ax.set_ylabel("Transmission [dB]")
+    ax.set_ylim(MIN_DB_FLOOR, 1.0)
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=4, fontsize=7)
+
+    summary = (
+        f"lambda0 = {design.center_wavelength_nm:.1f} nm\n"
+        f"spacing = {design.channel_spacing_ghz:.1f} GHz\n"
+        f"coupler = {design.coupler_response.source_name}"
+    )
+    ax.text(
+        0.02,
+        0.98,
+        summary,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.8"},
+    )
+
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+
+    if show_plot:
+        plt.show()
+
+    plt.close(fig)
+
+
 def format_report(design: CascadedMZI) -> str:
     title = "Cascaded AMZI Simple Design Report"
     lines = [
@@ -800,6 +1170,47 @@ def format_lan_demux_report(design: LANDemux) -> str:
     return "\n".join(lines)
 
 
+def format_cascaded_wdm_report(design: CascadedWDMDemux) -> str:
+    title = "16-Channel Cascaded MZI WDM Demux Report"
+    lines = [
+        title,
+        "=" * len(title),
+        f"Source            : {design.source_name}",
+        f"Center wavelength : {design.center_wavelength_nm:.3f} nm",
+        f"Effective index   : {design.effective_index:.4f}",
+        f"Group index       : {design.group_index:.4f}",
+        f"Channel spacing   : {design.channel_spacing_ghz:.3f} GHz",
+        f"Channels          : {design.channel_count}",
+        f"Tree order        : {design.order}",
+        f"Coupler source    : {design.coupler_response.source_name}",
+        "",
+        "Channel wavelengths",
+        "-" * 64,
+        f"{'Channel':>8} {'Wavelength [nm]':>18} {'Output port':>12}",
+    ]
+    port_by_channel = {channel: port_index for port_index, channel in enumerate(design.port_channels, start=1)}
+    for channel_index, wavelength_nm in enumerate(design.channel_wavelengths_nm, start=1):
+        lines.append(f"{channel_index:>8} {wavelength_nm:>18.3f} {port_by_channel[channel_index]:>12}")
+
+    lines.extend(
+        [
+            "",
+            "MZI delay settings",
+            "-" * 80,
+            f"{'MZI':>8} {'Level':>5} {'Node':>5} {'dL [um]':>12} {'Phase [rad]':>12} {'Through ch.':>18} {'Cross ch.':>18}",
+        ]
+    )
+    for stage in design.stages:
+        through = ",".join(str(channel) for channel in stage.through_channels)
+        cross = ",".join(str(channel) for channel in stage.cross_channels)
+        lines.append(
+            f"{stage.name:>8} {stage.level:>5} {stage.node_index:>5} "
+            f"{stage.delta_length_um:>12.3f} {stage.phase_offset_rad:>12.3f} "
+            f"{through:>18} {cross:>18}"
+        )
+    return "\n".join(lines)
+
+
 def format_lattice_report(design: LatticeFilter) -> str:
     lines = [
         "MZI Lattice Filter Design Report",
@@ -838,7 +1249,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--architecture",
-        choices=("simple", "lattice", "lan-wdm"),
+        choices=("simple", "lattice", "lan-wdm", "pub-16wdm"),
         default="simple",
         help="Filter architecture to synthesize.",
     )
@@ -852,6 +1263,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=4.5,
         help="LAN-WDM channel spacing in nm for the three-stage binary-tree demux.",
+    )
+    parser.add_argument(
+        "--channel-spacing-ghz",
+        type=float,
+        default=PUB_16WDM_CHANNEL_SPACING_GHZ,
+        help="Frequency-domain channel spacing in GHz for pub-16wdm.",
     )
     parser.add_argument(
         "--lattice-fsr",
@@ -878,6 +1295,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Power coupling ratio for each coupler (0 < ratio < 1).",
     )
     parser.add_argument(
+        "--coupler-excess-loss",
+        type=float,
+        default=None,
+        help="Per-coupler excess loss in dB for pub-16wdm. Defaults to 0.03 dB for pub-16wdm.",
+    )
+    parser.add_argument(
+        "--coupler-file",
+        type=Path,
+        default=None,
+        help="Optional Lumerical-style coupler CSV with wavelength_nm, coupling_ratio, and optional excess_loss_db.",
+    )
+    parser.add_argument(
+        "--coupler-wavelength-column",
+        type=str,
+        default="wavelength_nm",
+        help="Wavelength column name in --coupler-file.",
+    )
+    parser.add_argument(
+        "--coupler-ratio-column",
+        type=str,
+        default="coupling_ratio",
+        help="Power coupling ratio column name in --coupler-file.",
+    )
+    parser.add_argument(
+        "--coupler-loss-column",
+        type=str,
+        default="excess_loss_db",
+        help="Optional per-coupler excess loss column name in --coupler-file.",
+    )
+    parser.add_argument(
+        "--no-phase-offset",
+        action="store_true",
+        help="Disable automatic phase-offset alignment for binary-tree demux architectures.",
+    )
+    parser.add_argument(
         "--insertion-loss",
         type=float,
         default=0.2,
@@ -893,7 +1345,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--span",
         type=float,
-        default=20.0,
+        default=None,
         help="Spectrum span around the center wavelength in nm.",
     )
     parser.add_argument(
@@ -937,6 +1389,10 @@ def main() -> None:
         center_wavelength_nm = args.center_wavelength or PAPER_LAN_CENTER_WAVELENGTH_NM
         effective_index = args.effective_index or PAPER_LAN_EFFECTIVE_INDEX
         group_index = args.group_index or PAPER_LAN_GROUP_INDEX
+    elif args.architecture == "pub-16wdm":
+        center_wavelength_nm = args.center_wavelength or DEFAULT_CENTER_WAVELENGTH_NM
+        effective_index = args.effective_index or DEFAULT_EFFECTIVE_INDEX
+        group_index = args.group_index or DEFAULT_GROUP_INDEX
     else:
         center_wavelength_nm = args.center_wavelength or DEFAULT_CENTER_WAVELENGTH_NM
         effective_index = args.effective_index or DEFAULT_EFFECTIVE_INDEX
@@ -951,8 +1407,10 @@ def main() -> None:
         start_nm = args.start_wavelength
         stop_nm = args.stop_wavelength
     else:
-        start_nm = center_wavelength_nm - args.span / 2.0
-        stop_nm = center_wavelength_nm + args.span / 2.0
+        default_span_nm = 110.0 if args.architecture == "pub-16wdm" else 20.0
+        span_nm = args.span if args.span is not None else default_span_nm
+        start_nm = center_wavelength_nm - span_nm / 2.0
+        stop_nm = center_wavelength_nm + span_nm / 2.0
 
     if args.architecture == "simple":
         design = build_cascaded_mzi(
@@ -998,6 +1456,76 @@ def main() -> None:
                 print(f"Plot saved        : {args.plot_file}")
         return
 
+    if args.architecture == "pub-16wdm":
+        coupler_excess_loss_db = (
+            PUB_16WDM_COUPLER_EXCESS_LOSS_DB
+            if args.coupler_excess_loss is None
+            else args.coupler_excess_loss
+        )
+        if args.coupler_file is None:
+            coupler_response = constant_coupler_response(
+                coupling_ratio=args.coupler_ratio,
+                excess_loss_db=coupler_excess_loss_db,
+                source_name=f"constant k={args.coupler_ratio:.3f}, loss={coupler_excess_loss_db:.3f} dB/coupler",
+            )
+        else:
+            try:
+                coupler_response = load_coupler_response_csv(
+                    path=args.coupler_file,
+                    ratio_column=args.coupler_ratio_column,
+                    wavelength_column=args.coupler_wavelength_column,
+                    loss_column=args.coupler_loss_column,
+                    fallback_loss_db=coupler_excess_loss_db,
+                )
+            except ValueError as exc:
+                parser.exit(status=2, message=f"{exc}\n")
+
+        design = build_pub_16wdm_demux(
+            center_wavelength_nm=center_wavelength_nm,
+            effective_index=effective_index,
+            group_index=group_index,
+            channel_spacing_ghz=args.channel_spacing_ghz,
+            coupler_response=coupler_response,
+            optimize_phase_offsets=not args.no_phase_offset,
+        )
+
+        print(format_cascaded_wdm_report(design))
+        rows = cascaded_wdm_spectrum(design, start_nm=start_nm, stop_nm=stop_nm, points=args.points)
+        peaks = [
+            max(rows, key=lambda item, port_index=port_index: item[1][port_index])
+            for port_index in range(design.channel_count)
+        ]
+        print()
+        print("Spectrum summary")
+        print("-" * 45)
+        print(f"Sample range      : {start_nm:.3f} - {stop_nm:.3f} nm")
+        for port_index, peak in enumerate(peaks, start=1):
+            channel_index = design.port_channels[port_index - 1]
+            port_power = peak[1][port_index - 1]
+            print(
+                f"Port {port_index:>2} / ch {channel_index:>2} : "
+                f"{linear_to_db(port_power):>6.2f} dB @ {peak[0]:.3f} nm"
+            )
+
+        if args.csv is not None:
+            args.csv.parent.mkdir(parents=True, exist_ok=True)
+            save_multiport_spectrum_csv(args.csv, rows, port_count=design.channel_count)
+            print(f"CSV saved         : {args.csv}")
+
+        if args.plot or args.plot_file is not None:
+            try:
+                plot_cascaded_wdm_spectrum(
+                    design=design,
+                    rows=rows,
+                    output_path=args.plot_file,
+                    show_plot=args.plot,
+                )
+            except RuntimeError as exc:
+                parser.exit(status=1, message=f"{exc}\n")
+            if args.plot_file is not None:
+                print(f"Plot saved        : {args.plot_file}")
+        return
+
     if args.architecture == "lan-wdm":
         design = build_lan_wdm_demux(
             center_wavelength_nm=center_wavelength_nm,
@@ -1005,6 +1533,7 @@ def main() -> None:
             group_index=group_index,
             channel_spacing_nm=args.channel_spacing,
             coupler_ratio=args.coupler_ratio,
+            optimize_phase_offsets=not args.no_phase_offset,
         )
 
         print(format_lan_demux_report(design))
