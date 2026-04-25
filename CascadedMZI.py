@@ -11,6 +11,13 @@ from pathlib import Path
 NM_PER_M = 1e9
 UM_PER_M = 1e6
 MIN_DB_FLOOR = -60.0
+DEFAULT_CENTER_WAVELENGTH_NM = 1550.0
+DEFAULT_EFFECTIVE_INDEX = 2.40
+DEFAULT_GROUP_INDEX = 4.20
+PAPER_LAN_CENTER_WAVELENGTH_NM = 1291.0
+PAPER_LAN_EFFECTIVE_INDEX = 2.93
+PAPER_LAN_GROUP_INDEX = 3.83
+PAPER_LAN_CHANNEL_WAVELENGTHS_NM = (1273.5, 1277.9, 1282.3, 1286.7, 1295.6, 1300.1, 1304.6, 1309.1)
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,33 @@ class LatticeFilter:
         return len(self.delay_lengths_m)
 
 
+@dataclass(frozen=True)
+class DemuxMZIStage:
+    name: str
+    delta_length_m: float
+    coupler_ratio: float
+    phase_offset_rad: float
+
+    @property
+    def delta_length_um(self) -> float:
+        return self.delta_length_m * UM_PER_M
+
+
+@dataclass(frozen=True)
+class LANDemux:
+    center_wavelength_nm: float
+    effective_index: float
+    group_index: float
+    channel_spacing_nm: float
+    stages: tuple[DemuxMZIStage, ...]
+    channel_wavelengths_nm: tuple[float, ...]
+    port_wavelengths_nm: tuple[float, ...]
+
+    @property
+    def order(self) -> int:
+        return 3
+
+
 def linear_to_db(power: float, floor_db: float = MIN_DB_FLOOR) -> float:
     if power <= 0.0:
         return floor_db
@@ -83,6 +117,74 @@ def compute_delta_length_m(center_wavelength_nm: float, group_index: float, fsr_
 def compute_pi_length_m(center_wavelength_nm: float, effective_index: float) -> float:
     wavelength_m = center_wavelength_nm / NM_PER_M
     return wavelength_m / (2.0 * effective_index)
+
+
+def amzi_power_from_phase(coupling_ratio: float, phase_rad: float) -> tuple[float, float]:
+    field = (1.0 + 0.0j, 0.0 + 0.0j)
+    coupler = coupler_matrix(coupling_ratio)
+    field = multiply_matrix_vector(coupler, field)
+    field = (field[0] * exp(-1j * phase_rad), field[1])
+    field = multiply_matrix_vector(coupler, field)
+    return abs(field[0]) ** 2, abs(field[1]) ** 2
+
+
+def amzi_phase(
+    delta_length_m: float,
+    wavelength_nm: float,
+    center_wavelength_nm: float,
+    effective_index: float,
+    group_index: float,
+    phase_offset_rad: float | None = None,
+) -> float:
+    wavelength_m = wavelength_nm / NM_PER_M
+    center_wavelength_m = center_wavelength_nm / NM_PER_M
+    if phase_offset_rad is None:
+        phase = 2.0 * math.pi * effective_index * delta_length_m / center_wavelength_m
+    else:
+        phase = phase_offset_rad
+    return phase + 2.0 * math.pi * group_index * delta_length_m * (1.0 / wavelength_m - 1.0 / center_wavelength_m)
+
+
+def optimize_amzi_phase_offset(
+    delta_length_m: float,
+    coupling_ratio: float,
+    through_wavelengths_nm: tuple[float, ...],
+    cross_wavelengths_nm: tuple[float, ...],
+    center_wavelength_nm: float,
+    effective_index: float,
+    group_index: float,
+) -> float:
+    best_offset = 0.0
+    best_score = -math.inf
+    for step in range(720):
+        offset = 2.0 * math.pi * step / 720
+        score = 0.0
+        for wavelength_nm in through_wavelengths_nm:
+            phase = amzi_phase(
+                delta_length_m,
+                wavelength_nm,
+                center_wavelength_nm,
+                effective_index,
+                group_index,
+                offset,
+            )
+            through_power, _ = amzi_power_from_phase(coupling_ratio, phase)
+            score += math.log(max(through_power, 1e-12))
+        for wavelength_nm in cross_wavelengths_nm:
+            phase = amzi_phase(
+                delta_length_m,
+                wavelength_nm,
+                center_wavelength_nm,
+                effective_index,
+                group_index,
+                offset,
+            )
+            _, cross_power = amzi_power_from_phase(coupling_ratio, phase)
+            score += math.log(max(cross_power, 1e-12))
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+    return best_offset
 
 
 def get_lattice_filter_spec(
@@ -151,6 +253,89 @@ def build_lattice_filter(
     )
 
 
+def build_lan_wdm_demux(
+    center_wavelength_nm: float,
+    effective_index: float,
+    group_index: float,
+    channel_spacing_nm: float,
+    coupler_ratio: float,
+    channel_wavelengths_nm: tuple[float, ...] = PAPER_LAN_CHANNEL_WAVELENGTHS_NM,
+) -> LANDemux:
+    if center_wavelength_nm <= 0 or channel_spacing_nm <= 0:
+        raise ValueError("Wavelength and channel spacing must be positive.")
+    if group_index <= 0 or effective_index <= 0:
+        raise ValueError("Indices must be positive.")
+    if not 0 < coupler_ratio < 1:
+        raise ValueError("coupler_ratio must be between 0 and 1.")
+    if len(channel_wavelengths_nm) != 8:
+        raise ValueError("LAN-WDM demux requires exactly eight target channel wavelengths.")
+
+    # Photonics 2022, 9, 252 uses FSR1 = 2 * channel spacing for the first splitter.
+    delta_l1_m = compute_delta_length_m(
+        center_wavelength_nm=center_wavelength_nm,
+        group_index=group_index,
+        fsr_nm=2.0 * channel_spacing_nm,
+    )
+    delta_l_shift_m = compute_pi_length_m(center_wavelength_nm, effective_index) * 2.0
+
+    channel_1, channel_2, channel_3, channel_4, channel_6, channel_7, channel_8, channel_9 = channel_wavelengths_nm
+    stage_specs = (
+        ("1st", delta_l1_m, (channel_1, channel_3, channel_7, channel_9), (channel_2, channel_4, channel_6, channel_8)),
+        ("2nd_A", delta_l1_m / 2.0, (channel_1, channel_9), (channel_3, channel_7)),
+        (
+            "2nd_B",
+            delta_l1_m / 2.0 + 0.75 * delta_l_shift_m,
+            (channel_2, channel_6),
+            (channel_4, channel_8),
+        ),
+        ("3rd_A", delta_l1_m / 8.0, (channel_1,), (channel_9,)),
+        (
+            "3rd_B",
+            delta_l1_m / 4.0 + 0.25 * delta_l_shift_m,
+            (channel_3,),
+            (channel_7,),
+        ),
+        (
+            "3rd_C",
+            delta_l1_m / 4.0 + 0.125 * delta_l_shift_m,
+            (channel_2,),
+            (channel_6,),
+        ),
+        (
+            "3rd_D",
+            delta_l1_m / 4.0 + 0.375 * delta_l_shift_m,
+            (channel_4,),
+            (channel_8,),
+        ),
+    )
+
+    return LANDemux(
+        center_wavelength_nm=center_wavelength_nm,
+        effective_index=effective_index,
+        group_index=group_index,
+        channel_spacing_nm=channel_spacing_nm,
+        stages=tuple(
+            DemuxMZIStage(
+                name=name,
+                delta_length_m=delta_length_m,
+                coupler_ratio=coupler_ratio,
+                phase_offset_rad=optimize_amzi_phase_offset(
+                    delta_length_m=delta_length_m,
+                    coupling_ratio=coupler_ratio,
+                    through_wavelengths_nm=tuple(through_wavelengths_nm),
+                    cross_wavelengths_nm=tuple(cross_wavelengths_nm),
+                    center_wavelength_nm=center_wavelength_nm,
+                    effective_index=effective_index,
+                    group_index=group_index,
+                ),
+            )
+            for name, delta_length_m, through_wavelengths_nm, cross_wavelengths_nm in stage_specs
+        ),
+        channel_wavelengths_nm=channel_wavelengths_nm,
+        port_wavelengths_nm=(channel_1, channel_9, channel_3, channel_7, channel_2, channel_6, channel_4, channel_8),
+    )
+
+
 def build_cascaded_mzi(
     center_wavelength_nm: float,
     effective_index: float,
@@ -200,22 +385,6 @@ def build_cascaded_mzi(
     )
 
 
-def stage_transfer(stage: MZIStage, wavelength_nm: float, center_wavelength_nm: float, effective_index: float) -> float:
-    wavelength_m = wavelength_nm / NM_PER_M
-    phase = 2.0 * math.pi * effective_index * stage.delta_length_m / wavelength_m
-
-    kappa = stage.coupler_ratio
-    # Simple balanced MZI intensity response with non-ideal coupler ratio.
-    visibility = 4.0 * kappa * (1.0 - kappa)
-    ideal_transmission = 1.0 - visibility * (math.sin(phase / 2.0) ** 2)
-    loss_linear = 10.0 ** (-stage.insertion_loss_db / 10.0)
-
-    # Anchor the phase around the requested center wavelength for readability.
-    center_phase = 2.0 * math.pi * effective_index * stage.delta_length_m / (center_wavelength_nm / NM_PER_M)
-    normalized = 0.5 + 0.5 * math.cos(phase - center_phase)
-    return max(0.0, min(1.0, loss_linear * (0.5 * ideal_transmission + 0.5 * normalized)))
-
-
 def coupler_matrix(coupling_ratio: float) -> tuple[tuple[complex, complex], tuple[complex, complex]]:
     through = math.sqrt(1.0 - coupling_ratio)
     cross = -1j * math.sqrt(coupling_ratio)
@@ -230,6 +399,47 @@ def multiply_matrix_vector(
         matrix[0][0] * vector[0] + matrix[0][1] * vector[1],
         matrix[1][0] * vector[0] + matrix[1][1] * vector[1],
     )
+
+
+def amzi_port_powers(
+    delta_length_m: float,
+    coupling_ratio: float,
+    wavelength_nm: float,
+    center_wavelength_nm: float,
+    effective_index: float,
+    group_index: float,
+    center_phase_rad: float | None = None,
+) -> tuple[float, float]:
+    phase = amzi_phase(
+        delta_length_m=delta_length_m,
+        wavelength_nm=wavelength_nm,
+        center_wavelength_nm=center_wavelength_nm,
+        effective_index=effective_index,
+        group_index=group_index,
+        phase_offset_rad=center_phase_rad,
+    )
+    return amzi_power_from_phase(coupling_ratio, phase)
+
+
+def stage_transfer(
+    stage: MZIStage,
+    wavelength_nm: float,
+    center_wavelength_nm: float,
+    effective_index: float,
+    group_index: float,
+) -> float:
+    # Use the constructive AMZI output port as the stage transmission.
+    loss_linear = 10.0 ** (-stage.insertion_loss_db / 10.0)
+    _, cross_power = amzi_port_powers(
+        delta_length_m=stage.delta_length_m,
+        coupling_ratio=stage.coupler_ratio,
+        wavelength_nm=wavelength_nm,
+        center_wavelength_nm=center_wavelength_nm,
+        effective_index=effective_index,
+        group_index=group_index,
+        center_phase_rad=0.0,
+    )
+    return max(0.0, min(1.0, loss_linear * cross_power))
 
 
 def lattice_transfer(
@@ -272,6 +482,7 @@ def spectrum(
                 wavelength_nm=wavelength_nm,
                 center_wavelength_nm=design.center_wavelength_nm,
                 effective_index=design.effective_index,
+                group_index=design.group_index,
             )
         values.append((wavelength_nm, transmission))
     return values
@@ -297,6 +508,52 @@ def lattice_spectrum(
     return values
 
 
+def lan_demux_transfer(design: LANDemux, wavelength_nm: float) -> tuple[float, ...]:
+    stages = {stage.name: stage for stage in design.stages}
+
+    def split(stage_name: str, input_power: float) -> tuple[float, float]:
+        stage = stages[stage_name]
+        through_power, cross_power = amzi_port_powers(
+            delta_length_m=stage.delta_length_m,
+            coupling_ratio=stage.coupler_ratio,
+            wavelength_nm=wavelength_nm,
+            center_wavelength_nm=design.center_wavelength_nm,
+            effective_index=design.effective_index,
+            group_index=design.group_index,
+            center_phase_rad=stage.phase_offset_rad,
+        )
+        return input_power * through_power, input_power * cross_power
+
+    root_through, root_cross = split("1st", 1.0)
+    stage_2a_through, stage_2a_cross = split("2nd_A", root_through)
+    stage_2b_through, stage_2b_cross = split("2nd_B", root_cross)
+
+    port_1, port_2 = split("3rd_A", stage_2a_through)
+    port_3, port_4 = split("3rd_B", stage_2a_cross)
+    port_5, port_6 = split("3rd_C", stage_2b_through)
+    port_7, port_8 = split("3rd_D", stage_2b_cross)
+    return (port_1, port_2, port_3, port_4, port_5, port_6, port_7, port_8)
+
+
+def lan_demux_spectrum(
+    design: LANDemux,
+    start_nm: float,
+    stop_nm: float,
+    points: int,
+) -> list[tuple[float, tuple[float, ...]]]:
+    if points < 2:
+        raise ValueError("points must be 2 or larger.")
+    if stop_nm <= start_nm:
+        raise ValueError("stop_nm must be larger than start_nm.")
+
+    values: list[tuple[float, tuple[float, ...]]] = []
+    step = (stop_nm - start_nm) / (points - 1)
+    for idx in range(points):
+        wavelength_nm = start_nm + idx * step
+        values.append((wavelength_nm, lan_demux_transfer(design, wavelength_nm)))
+    return values
+
+
 def save_spectrum_csv(path: Path, rows: list[tuple[float, float]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
@@ -311,6 +568,16 @@ def save_lattice_spectrum_csv(path: Path, rows: list[tuple[float, float, float]]
         writer.writerows(
             (wavelength_nm, linear_to_db(through), linear_to_db(cross))
             for wavelength_nm, through, cross in rows
+        )
+
+
+def save_lan_demux_spectrum_csv(path: Path, rows: list[tuple[float, tuple[float, ...]]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["wavelength_nm", *(f"port_{index}_db" for index in range(1, 9))])
+        writer.writerows(
+            (wavelength_nm, *(linear_to_db(power) for power in port_powers))
+            for wavelength_nm, port_powers in rows
         )
 
 
@@ -332,7 +599,7 @@ def plot_spectrum(
 
     fig, ax = plt.subplots(figsize=(8, 4.8))
     ax.plot(wavelengths, transmissions_db, color="tab:blue", linewidth=2.0)
-    ax.set_title(f"Cascaded MZI Spectrum ({len(design.stages)} stages)")
+    ax.set_title(f"Cascaded AMZI Spectrum ({len(design.stages)} stages)")
     ax.set_xlabel("Wavelength [nm]")
     ax.set_ylabel("Transmission [dB]")
     ax.set_ylim(MIN_DB_FLOOR, 1.0)
@@ -422,10 +689,66 @@ def plot_lattice_spectrum(
     plt.close(fig)
 
 
+def plot_lan_demux_spectrum(
+    design: LANDemux,
+    rows: list[tuple[float, tuple[float, ...]]],
+    output_path: Path | None = None,
+    show_plot: bool = False,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "matplotlib is not installed. Install it with 'pip install matplotlib' to enable plotting."
+        ) from exc
+
+    wavelengths = [row[0] for row in rows]
+
+    fig, ax = plt.subplots(figsize=(9.0, 5.2))
+    for port_index in range(8):
+        port_db = [linear_to_db(row[1][port_index]) for row in rows]
+        ax.plot(wavelengths, port_db, label=f"Port {port_index + 1}", linewidth=1.7)
+
+    ax.set_title("Three-Stage Cascaded MZI LAN-WDM Demux")
+    ax.set_xlabel("Wavelength [nm]")
+    ax.set_ylabel("Transmission [dB]")
+    ax.set_ylim(MIN_DB_FLOOR, 1.0)
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=4, fontsize=8)
+
+    summary = (
+        f"lambda0 = {design.center_wavelength_nm:.1f} nm\n"
+        f"spacing = {design.channel_spacing_nm:.2f} nm\n"
+        f"ng = {design.group_index:.2f}, neff = {design.effective_index:.2f}"
+    )
+    ax.text(
+        0.02,
+        0.98,
+        summary,
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.8"},
+    )
+
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+
+    if show_plot:
+        plt.show()
+
+    plt.close(fig)
+
+
 def format_report(design: CascadedMZI) -> str:
+    title = "Cascaded AMZI Simple Design Report"
     lines = [
-        "Cascaded MZI Simple Design Report",
-        "=" * 33,
+        title,
+        "=" * len(title),
         f"Center wavelength : {design.center_wavelength_nm:.3f} nm",
         f"Effective index   : {design.effective_index:.4f}",
         f"Group index       : {design.group_index:.4f}",
@@ -449,6 +772,31 @@ def format_report(design: CascadedMZI) -> str:
             f"{stage.insertion_loss_db:>10.2f}"
         )
 
+    return "\n".join(lines)
+
+
+def format_lan_demux_report(design: LANDemux) -> str:
+    title = "Three-Stage Cascaded MZI LAN-WDM Demux Report"
+    lines = [
+        title,
+        "=" * len(title),
+        f"Center wavelength : {design.center_wavelength_nm:.3f} nm",
+        f"Effective index   : {design.effective_index:.4f}",
+        f"Group index       : {design.group_index:.4f}",
+        f"Channel spacing   : {design.channel_spacing_nm:.3f} nm",
+        f"Target channels   : {', '.join(f'{wavelength_nm:.1f}' for wavelength_nm in design.channel_wavelengths_nm)} nm",
+        f"Port targets      : {', '.join(f'P{index + 1}={wavelength_nm:.1f}' for index, wavelength_nm in enumerate(design.port_wavelengths_nm))} nm",
+        f"Tree order        : {design.order}",
+        "",
+        "MZI delay settings",
+        "-" * 45,
+        f"{'MZI':>7} {'dL [um]':>14} {'Coupler':>10} {'Phase [rad]':>12}",
+    ]
+    for stage in design.stages:
+        lines.append(
+            f"{stage.name:>7} {stage.delta_length_um:>14.3f} "
+            f"{stage.coupler_ratio:>10.2f} {stage.phase_offset_rad:>12.3f}"
+        )
     return "\n".join(lines)
 
 
@@ -486,19 +834,25 @@ def format_lattice_report(design: LatticeFilter) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Simple design helper for cascaded Mach-Zehnder interferometers."
+        description="Simple design helper for cascaded asymmetric Mach-Zehnder interferometers."
     )
     parser.add_argument(
         "--architecture",
-        choices=("simple", "lattice"),
+        choices=("simple", "lattice", "lan-wdm"),
         default="simple",
         help="Filter architecture to synthesize.",
     )
-    parser.add_argument("--center-wavelength", type=float, default=1550.0, help="Center wavelength in nm.")
-    parser.add_argument("--effective-index", type=float, default=2.40, help="Effective index.")
-    parser.add_argument("--group-index", type=float, default=4.20, help="Group index.")
+    parser.add_argument("--center-wavelength", type=float, default=None, help="Center wavelength in nm.")
+    parser.add_argument("--effective-index", type=float, default=None, help="Effective index.")
+    parser.add_argument("--group-index", type=float, default=None, help="Group index.")
     parser.add_argument("--stages", type=int, default=3, help="Number of cascaded MZI stages.")
     parser.add_argument("--base-fsr", type=float, default=8.0, help="First-stage FSR in nm.")
+    parser.add_argument(
+        "--channel-spacing",
+        type=float,
+        default=4.5,
+        help="LAN-WDM channel spacing in nm for the three-stage binary-tree demux.",
+    )
     parser.add_argument(
         "--lattice-fsr",
         type=float,
@@ -579,6 +933,15 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.architecture == "lan-wdm":
+        center_wavelength_nm = args.center_wavelength or PAPER_LAN_CENTER_WAVELENGTH_NM
+        effective_index = args.effective_index or PAPER_LAN_EFFECTIVE_INDEX
+        group_index = args.group_index or PAPER_LAN_GROUP_INDEX
+    else:
+        center_wavelength_nm = args.center_wavelength or DEFAULT_CENTER_WAVELENGTH_NM
+        effective_index = args.effective_index or DEFAULT_EFFECTIVE_INDEX
+        group_index = args.group_index or DEFAULT_GROUP_INDEX
+
     has_start = args.start_wavelength is not None
     has_stop = args.stop_wavelength is not None
     if has_start != has_stop:
@@ -588,14 +951,14 @@ def main() -> None:
         start_nm = args.start_wavelength
         stop_nm = args.stop_wavelength
     else:
-        start_nm = args.center_wavelength - args.span / 2.0
-        stop_nm = args.center_wavelength + args.span / 2.0
+        start_nm = center_wavelength_nm - args.span / 2.0
+        stop_nm = center_wavelength_nm + args.span / 2.0
 
     if args.architecture == "simple":
         design = build_cascaded_mzi(
-            center_wavelength_nm=args.center_wavelength,
-            effective_index=args.effective_index,
-            group_index=args.group_index,
+            center_wavelength_nm=center_wavelength_nm,
+            effective_index=effective_index,
+            group_index=group_index,
             stage_count=args.stages,
             base_fsr_nm=args.base_fsr,
             fsr_scale=args.fsr_scale,
@@ -635,10 +998,52 @@ def main() -> None:
                 print(f"Plot saved        : {args.plot_file}")
         return
 
+    if args.architecture == "lan-wdm":
+        design = build_lan_wdm_demux(
+            center_wavelength_nm=center_wavelength_nm,
+            effective_index=effective_index,
+            group_index=group_index,
+            channel_spacing_nm=args.channel_spacing,
+            coupler_ratio=args.coupler_ratio,
+        )
+
+        print(format_lan_demux_report(design))
+        rows = lan_demux_spectrum(design, start_nm=start_nm, stop_nm=stop_nm, points=args.points)
+        peaks = [
+            max(rows, key=lambda item, port_index=port_index: item[1][port_index])
+            for port_index in range(8)
+        ]
+        print()
+        print("Spectrum summary")
+        print("-" * 45)
+        print(f"Sample range      : {start_nm:.3f} - {stop_nm:.3f} nm")
+        for port_index, peak in enumerate(peaks, start=1):
+            port_power = peak[1][port_index - 1]
+            print(f"Port {port_index:>2} peak      : {linear_to_db(port_power):>6.2f} dB @ {peak[0]:.3f} nm")
+
+        if args.csv is not None:
+            args.csv.parent.mkdir(parents=True, exist_ok=True)
+            save_lan_demux_spectrum_csv(args.csv, rows)
+            print(f"CSV saved         : {args.csv}")
+
+        if args.plot or args.plot_file is not None:
+            try:
+                plot_lan_demux_spectrum(
+                    design=design,
+                    rows=rows,
+                    output_path=args.plot_file,
+                    show_plot=args.plot,
+                )
+            except RuntimeError as exc:
+                parser.exit(status=1, message=f"{exc}\n")
+            if args.plot_file is not None:
+                print(f"Plot saved        : {args.plot_file}")
+        return
+
     design = build_lattice_filter(
-        center_wavelength_nm=args.center_wavelength,
-        effective_index=args.effective_index,
-        group_index=args.group_index,
+        center_wavelength_nm=center_wavelength_nm,
+        effective_index=effective_index,
+        group_index=group_index,
         fsr_nm=args.lattice_fsr,
         preset_name=args.lattice_preset,
     )
